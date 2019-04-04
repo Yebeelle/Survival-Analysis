@@ -1,0 +1,673 @@
+---
+title: "It's About Time: Using Survival Analysis to Gain Time-Based People Insights"
+author: "Behailu Bekera"
+date: "April 4, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Part 0: House Keeping
+
+
+```{r }
+#Clear your workspace
+#rm(list = ls()) 
+
+#set working directory to where the data resides
+setwd("C:/Users/bbekera/Desktop/SIOP Master Tutorial")
+load(file = "Data/Survival.RData")
+```
+
+```{r message=FALSE}
+#Load required packages
+library(survival)
+library(dplyr)
+library(ranger)
+library(ggplot2)
+library(survminer)
+library(pec)
+```
+
+```{r message=FALSE}
+#Load data
+data <- merge_data
+```
+
+Columns:
+
+applicant_id  
+term_reason_text  
+application_date  
+hire_date  
+term_date  
+emp1_start_date  
+emp1_end_date  
+new_job_title_hire  
+times_available  
+times_not_available  
+highest_education  
+overall_percentile  
+storelocation  
+home_state_province  
+home_city  
+
+
+# Part 1: Data preparation
+
+```{r message=FALSE}
+#Remove temporary positions and reduction in force
+data <- subset(data, term_reason_text != "Invol-Elimination of Position")
+data <- subset(data, term_reason_text != "Invol-End of Temporary Pos")
+data <- subset(data, term_reason_text != "Invol - Location Closure")
+```
+
+```{r message=FALSE}
+
+#Date variables to format into "%m/%d/%Y" format
+datvar<-c("application_date","hire_date","term_date","emp1_start_date","emp1_end_date","emp2_start_date","emp2_end_date","emp3_start_date","emp3_end_date","emp4_start_date","emp4_end_date","edu1_start_date", "edu2_start_date","edu3_start_date","edu4_start_date")
+
+#Format date variables
+data[,c(which(colnames(data) %in% datvar))] <- lapply(data[c(which(colnames(data) %in% datvar))],function(x) as.Date(x,format="%m/%d/%Y"))
+```
+
+```{r message=FALSE}
+#Calculate best guess of data extract date as the maximum termination date reported
+#this is the right censor date for the survival analysis
+extract_date <- max(data$term_date, na.rm=T)
+
+#Calculate raw tenure variables
+data$tenure_raw <- as.numeric(data$term_date - data$hire_date)
+
+#counts how many cases have a hire_date after the term_date
+sum(data$hire_date>data$term_date, na.rm=T) 
+
+#Flag for excluding negative values for tenure
+data$exclude<-ifelse(data$hire_date>data$term_date,1,0)
+```
+```{r message=FALSE}
+#Used to substitute tenure value when term_date is NA
+data$since_hire <- extract_date - data$hire_date
+
+#Create clean continuous tenure variable
+#This is the time to event 
+data$tenure_cont <- NA
+
+for(i in 1:nrow(data)){
+  #minimum of raw tenure or days since hired; only fills in days since hire if the raw is NA
+  data$tenure_cont[i] <- min(c(data$tenure_raw[i],data$since_hire[i]), na.rm=T) 
+} 
+
+#Overwrite NA for nonsense values
+data$tenure_cont[data$exclude == 1] <- NA  
+
+#Tenure summary stats
+summary(data$tenure_cont)
+```
+
+```{r}
+hist(data$tenure_cont, main = "Distribution of Time to Event", xlab = "Tenure_cont")
+```
+
+
+
+
+```{r message=FALSE}
+#create attrition variable to indicate whether the event happended during the study period
+#sum(is.na(data$term_date))
+data$attrited <- ifelse(is.na(data$term_date) == TRUE,0,1)
+
+#Number of attrites and those stayed
+table(data$attrited)
+
+#Tenure distribution among stayers 
+summary(data$tenure_cont[data$attrited == 0])
+
+#Tenure distribution among stayers
+summary(data$tenure_cont[data$attrited == 1])
+```
+
+
+
+
+
+# Part 2: Survival Curve Analysis
+
+```{r message=FALSE}
+#Retain data for those currently with a Sales Associate job title
+sa_data <- subset(data, new_job_title_hire == "Sales Associate")
+```
+
+```{r message=FALSE}
+#Create a survival object that is used as a response variable in a model formula. 
+sa_surv <- Surv(sa_data$tenure_cont, sa_data$attrited)
+
+#Right-censored times to event (where attrition wasn't observed yet) have a "+" sign
+#Printing out the first 30
+head(sa_surv,30)
+
+#Printing out tenure values for the first 30 
+sa_data$tenure_cont[0:30]
+```
+
+
+
+The formula sa_surv ~ 1 instructs the survfit() function to fit a model with intercept only,   
+and produces the Kaplan-Meier survival curve estimate.
+
+```{r message=FALSE}
+sa_km_fit <- survfit(sa_surv ~ 1)
+```
+
+```{r}
+#Option 1 ploting KM curve
+plot(sa_km_fit,
+     main = 'Survival Rate for Sales Associates',ylab = "Survival Rate", xlab = "Days")
+legend(1000, 0.99, legend = c('K-M survival estimate'), lty = 1:2)
+```
+
+
+```{r, echo=FALSE}
+#Option 2 plotting using surviminer package
+ggsurv <- ggsurvplot(
+  sa_km_fit,                  # survfit object with calculated statistics.
+  data = sa_data,             # data used to fit survival curves.
+  palette = c("#32CD32"),
+  xlim = c(0,700),         # present narrower X axis, but not affects.
+  xlab = "Time in days",   # customize X axis label.
+  ylab="Survival Rate",
+  break.time.by = 100,     # break X axis in time intervals by 500.
+  ggtheme = theme_light(), # customize plot and risk table with a theme.
+  surv.median.line = "hv"  # add the median survival pointer.
+  ,title='Survival Rate for Sales Associates'
+  )
+ggsurv
+```
+
+To get the number of days after which survival Rate reaches a certain percentage (e.g. 75%, 50%, 25%, 62%, 43%, 26%)
+
+```{r}
+#head(summary(sa_km_fit))
+
+Time_and_prob=cbind.data.frame(sa_km_fit$time,sa_km_fit$surv)
+colnames(Time_and_prob)<-c("time", "surv")
+
+Time_and_prob$surv= round(Time_and_prob$surv, 2)
+
+Probs= c(0.75, 0.5, 0.25, 0.62, 0.43, 0.26)
+
+for (i in 1: length(Probs)){
+  print (paste("Survival Rate reaches ", Probs[i], "%", " on day ", max(Time_and_prob$time[Time_and_prob$surv==Probs[i]]),sep = ""))
+}
+```
+
+## Part 3: Feature Engineering
+
+Creating features associated with availability:
+
+```{r}
+#See some of the raw times available values
+head(data$times_available,1)
+
+#Initialize new times available features
+data$time_slots_available <- 0
+data$weekends_only <- NA
+data$weekdays_only <- NA
+data$both <- NA
+
+#Populate these times available features with values
+for (i in 1:nrow(data)){
+  temp <- as.character(data$times_available[i])
+  
+  #Number of time slots available
+  data$time_slots_available[i] <- length(unlist(strsplit(temp,";")))
+  
+  #1 if available weekends ONLY, 0 otherwise even if no time slots mentioned at all
+  data$weekends_only[i] <- ifelse(grepl("(Sat|Sun)",temp) == TRUE & grepl("(Mon|Tues|Wed|Thurs|Fri)",temp) == FALSE,1,0)
+  
+  #1 if available weekdays ONLY, 0 otherwise even if no time slots mentioned at all
+  data$weekdays_only[i] <- ifelse(grepl("(Sat|Sun)",temp) == FALSE & grepl("(Mon|Tues|Wed|Thurs|Fri)",temp) == TRUE,1,0)
+  
+  #1 if available both weekdays and weekends, 0 otherwise even if no time slots mentioned at all
+  data$both[i] <- ifelse(grepl("(Sat|Sun)",temp) == TRUE & grepl("(Mon|Tues|Wed|Thurs|Fri)",temp) == TRUE,1,0)
+}
+
+#Fill in NA if no time slots selected, that
+data$weekends_only[data$time_slots_available == 0] <- NA # Now, data$weekends_only==1 => weekends_only and 0 means weekdays, NA mean no time slots given
+data$weekdays_only[data$time_slots_available == 0] <- NA #Now, data$weekdays_only==1 => weekdays_only and 0 means weekends, NA mean no time slots given
+data$both[data$time_slots_available == 0] <- NA # Now, data$both==1 => mentioned both weekends and weekdays, NA means neither(no time slots given)
+
+
+#table(data$time_slots_available) #Number of time slots applicant is available for
+#table(data$weekends_only)
+#table(data$weekdays_only)
+#table(data$both)
+```
+
+
+Creating Education Level features:
+
+```{r}
+#Highest education values
+table(data$highest_education)
+
+#Renaming and standardizing highest edudaction data
+data$highest_education[data$highest_education == "Associates&#39;s Degree"] <- "Associates's Degree"
+data$highest_education[data$highest_education == "Associatess Degree"] <- "Associates's Degree"
+data$highest_education[data$highest_education == "Bachelor&#39;s Degree"] <- "Bachelor's Degree"
+data$highest_education[data$highest_education == "Bachelors Degree"] <- "Bachelor's Degree"
+data$highest_education[data$highest_education == "Master&#39;s Degree"] <- "Master's Degree"
+data$highest_education[data$highest_education == "Masters Degree"] <- "Master's Degree"
+data$highest_education <- factor(data$highest_education)
+```
+
+```{r}
+#Creating binary versions of highest education features
+data$high_school <- ifelse(data$highest_education == "High School or Equivalency",1,0)
+data$associates <- ifelse(data$highest_education == "Associates's Degree",1,0)
+data$bachelor <- ifelse(data$highest_education == "Bachelor's Degree",1,0)
+data$masters_plus <- ifelse(data$highest_education == "Master's Degree" | data$highest_education == "Doctoral Degree",1,0)
+
+data$college <- ifelse(data$highest_education == "Associates's Degree"|
+                         data$highest_education == "Bachelor's Degree"|
+                         data$highest_education == "College Diploma"|
+                         data$highest_education == "Doctoral Degree"|
+                         data$highest_education == "Master's Degree",1,0)
+```
+
+```{r}
+#Number of applicants vs non
+#table(data$high_school)
+#table(data$associates)
+#table(data$bachelor)
+#table(data$masters_plus)
+#table(data$college)
+```
+
+
+
+Creating rehire related feature
+
+```{r, echo=FALSE}
+data$rehire <- 0
+data$rehire[grepl("Pier (One|1)", data$emp1_name, ignore.case = TRUE) == TRUE] <- 1
+data$rehire[grepl("Pier (One|1)", data$emp2_name, ignore.case = TRUE) == TRUE] <- 1
+data$rehire[grepl("Pier (One|1)", data$emp3_name, ignore.case = TRUE) == TRUE] <- 1
+
+```
+
+## Part 4: Feature-specific survival curve analysis
+
+```{r}
+#Subset sales associate data beause that is the role this model is going to be built for.
+sa_data <- subset(data, new_job_title_hire == "Sales Associate")
+sl_data <- subset(data, new_job_title_hire == "Sales Leader")
+```
+
+
+```{r}
+#Overlay KM Plots based on job applied for
+
+#Applied to Sales Associate role
+sa_data_sa_app <- subset(sa_data, new_job_group_application == "Retail Salespersons")
+
+#Applied to Sales Leader role
+sa_data_sl_app <- subset(sa_data, new_job_group_application == "First-Line Supervisors of Retail Sales Workers")
+
+#Create survival object for both types of applicants
+sa_surv_sa_app <- Surv(sa_data_sa_app$tenure_cont, sa_data_sa_app$attrited)
+sa_sa_app_km_fit <- survfit(sa_surv_sa_app ~ 1)
+
+sa_surv_sl_app <- Surv(sa_data_sl_app$tenure_cont, sa_data_sl_app$attrited)
+sa_sl_app_km_fit <- survfit(sa_surv_sl_app ~ 1)
+
+plot(sa_sa_app_km_fit$surv,
+     main = 'Position Applied Fore', ylab = "Survival Rate", xlab = "Days",lty = 2, pch = 20)
+points(sa_sl_app_km_fit$surv, col = "red",lty = 2, pch = 20)
+legend(400, 0.99, legend = c('Associate','Leader'),  
+                        col = c("black","red"), pch = c(20,20),
+                        lwd = c(1,1))
+
+```
+
+Rehire or not:
+
+```{r}
+wdata <- subset(sa_data, rehire == 1)
+sa_surv_rehire_yes <- Surv(wdata$tenure_cont, wdata$attrited)
+sa_rehire_yes_km_fit <- survfit(sa_surv_rehire_yes ~ 1)
+
+wdata <- subset(sa_data, rehire == 0)
+sa_surv_rehire_no <- Surv(wdata$tenure_cont, wdata$attrited)
+sa_rehire_no_km_fit <- survfit(sa_surv_rehire_no ~ 1)
+
+
+plot(sa_rehire_yes_km_fit$surv,
+     main = 'Sales Associate Survival Estimate by Rehire Status', 
+     ylab = "Survival Rate", xlab = "Days",
+     lty = 2, pch = 20, col = "violetred")
+points(sa_rehire_no_km_fit$surv, col = "turquoise4",lty = 2, pch = 20)
+legend(200, 0.99, legend = c('Rehire - Yes','Rehire - No'), 
+       col = c("violetred","turquoise4"),
+       lwd = c(3,3), pch = 20)
+```
+
+Highest education:
+
+```{r}
+wdata <- subset(sa_data, high_school == 1)
+sa_surv_hs <- Surv(wdata$tenure_cont, wdata$attrited)
+sa_hs_km_fit <- survfit(sa_surv_hs ~ 1)
+
+wdata <- subset(sa_data, associates == 1)
+sa_surv_associates <- Surv(wdata$tenure_cont, wdata$attrited)
+sa_associates_km_fit <- survfit(sa_surv_associates ~ 1)
+
+wdata <- subset(sa_data, bachelor == 1)
+sa_surv_bachelor <- Surv(wdata$tenure_cont, wdata$attrited)
+sa_bachelor_km_fit <- survfit(sa_surv_bachelor ~ 1)
+
+wdata <- subset(sa_data, masters_plus == 1)
+sa_surv_masters_plus <- Surv(wdata$tenure_cont, wdata$attrited)
+sa_masters_plus_km_fit <- survfit(sa_surv_masters_plus ~ 1)
+
+wdata <- subset(sa_data, college == 1)
+sa_surv_college_yes <- Surv(wdata$tenure_cont, wdata$attrited)
+sa_college_yes_km_fit <- survfit(sa_surv_college_yes ~ 1)
+
+wdata <- subset(sa_data, college == 0)
+sa_surv_college_no <- Surv(wdata$tenure_cont, wdata$attrited)
+sa_college_no_km_fit <- survfit(sa_surv_college_no ~ 1)
+
+
+plot(sa_hs_km_fit$surv,
+     main = 'Education Level', 
+     ylab = "%", xlab = "Days",
+     lty = 2, pch = 20, col = "slateblue2", xlim = c(0,730))
+points(sa_associates_km_fit$surv, col = "darkolivegreen",lty = 2, pch = 20)
+points(sa_bachelor_km_fit$surv, col = "violetred4",lty = 2, pch = 20)
+points(sa_masters_plus_km_fit$surv, col = "yellow4",lty = 2, pch = 20)
+legend(200, 0.99, legend = c('High School','Associates','Bachelors','Masters+'), 
+       col = c("slateblue2","darkolivegreen",'violetred4','yellow4'),
+       lwd = c(3,3), pch = 20)
+
+```
+
+Survival by Hours Available:
+
+```{r}
+wdata <- subset(sa_data, weekends_only == 1)
+sa_surv_weekend <- Surv(wdata$tenure_cont, wdata$attrited)
+sa_weekend_km_fit <- survfit(sa_surv_weekend ~ 1)
+
+
+wdata <- subset(sa_data, weekdays_only == 1)
+sa_surv_weekday <- Surv(wdata$tenure_cont, wdata$attrited)
+sa_weekday_km_fit <- survfit(sa_surv_weekday ~ 1)
+
+
+wdata <- subset(sa_data, both == 1)
+sa_surv_both <- Surv(wdata$tenure_cont, wdata$attrited)
+sa_both_km_fit <- survfit(sa_surv_both ~ 1)
+
+
+
+plot(sa_both_km_fit$surv,
+     main = 'Time Available',
+     ylab = "Survival Rate", xlab = "Days",
+     lty = 2, pch = 20)
+points(sa_weekend_km_fit$surv, col = "turquoise",lty = 2, pch = 20)
+points(sa_weekday_km_fit$surv, col = "salmon",lty = 2, pch = 20)
+
+legend(400, 0.99, legend = c('Both','Weekend Only','Weekday Only'),
+       col = c("black","turquoise","salmon"),
+       lwd = c(3,3,3), pch = 20)
+
+```
+
+Sales Associate Survival Estimate by Assessment Score Group:
+
+```{r}
+#check for NA values
+#sum(is.na(sa_data_sa_app$overall_percentile))
+
+#Create catagorical assessment score feature
+sa_data_sa_app$assessment_group <- ifelse(sa_data_sa_app$overall_percentile < 30, "Zero to <30",
+                                          ifelse(sa_data_sa_app$overall_percentile < 70, "30 to <70","70 to 100"))
+
+#Subsetting applicants with assessment_group == "Zero to <30"
+wdata <- subset(sa_data_sa_app, assessment_group == "Zero to <30")
+sa_surv_0_30 <- Surv(wdata$tenure_cont, wdata$attrited)
+sa_0_30_km_fit <- survfit(sa_surv_0_30 ~ 1)
+
+#Subsetting applicants with assessment_group == "30 to 70"
+wdata <- subset(sa_data_sa_app, assessment_group == "30 to <70")
+sa_surv_30_70 <- Surv(wdata$tenure_cont, wdata$attrited)
+sa_30_70_km_fit <- survfit(sa_surv_30_70 ~ 1)
+
+#Subsetting applicants with assessment_group == "70 to 100"
+wdata <- subset(sa_data_sa_app, assessment_group == "70 to 100")
+sa_surv_70_100 <- Surv(wdata$tenure_cont, wdata$attrited)
+sa_70_100_km_fit <- survfit(sa_surv_70_100 ~ 1)
+
+
+plot(sa_0_30_km_fit$surv,
+     main = 'Assessment Score Group', 
+     ylab = "Survival Rate", xlab = "Days",
+     lty = 2, pch = 20)
+points(sa_30_70_km_fit$surv, col = "blue", lty = 2, pch = 20)
+points(sa_70_100_km_fit$surv, col = "orange", lty = 2, pch = 20)
+
+legend(400, 0.99, legend = c('0 to 30','30 to 70','70 to 100'), 
+       col = c("black","blue","orange"),
+       lwd = c(3,3,3),pch = 20)
+```
+
+Store or Regional Information:Create Regional Identifiers
+
+```{r, include=FALSE}
+sa_data$canada_flag <- NA
+canada_provinces <- "(Northwest Territories|Nunavut|Ontario|Prince Edward Island|Yukon|New Brunswick|Manitoba|Newfoundland|Nova Scotia|Saskatchewan|Quebec|British Columbia|Alberta)"
+sa_data$canada_flag[grepl(canada_provinces, sa_data$home_state_province) == TRUE] <- 1
+sa_data$canada_flag[grepl(canada_provinces, sa_data$home_state_province) == FALSE] <- 0
+
+#Regional compariosn
+wdata <- subset(sa_data, canada_flag == 1)
+sa_surv_canada <- Surv(wdata$tenure_cont, wdata$attrited)
+sa_canada_km_fit <- survfit(sa_surv_canada ~ 1)
+
+wdata <- subset(sa_data, canada_flag == 0)
+sa_surv_us <- Surv(wdata$tenure_cont, wdata$attrited)
+sa_us_km_fit <- survfit(sa_surv_us ~ 1)
+```
+
+```{r}
+plot(sa_us_km_fit$surv,
+     main = 'By Region', 
+     ylab = "Survival Rate", xlab = "Days",
+     lty = 2, pch = 20, col = "blue")
+points(sa_canada_km_fit$surv, col = "red",lty = 2, pch = 20)
+legend(400, 0.99, legend = c('Region A','Region B'), 
+       col = c("blue","red"),
+       lwd = c(3,3), pch = 20)
+```
+
+
+
+## Part 5: Cox Proportional Hazard Regression Model
+
+```{r}
+
+#Create binary assessment score features
+sa_data$assess_0_30 <- ifelse(sa_data$overall_percentile < 30, 1,0)
+sa_data$assess_30_70 <- ifelse(sa_data$overall_percentile >= 30 & sa_data$overall_percentile < 70, 1,0)
+sa_data$assess_70_100 <- ifelse(sa_data$overall_percentile >= 70, 1,0)
+```
+```{r}
+#Binarize 'job applied for' feature
+sa_data$sa_app <- ifelse(sa_data$new_job_group_application == "Retail Salespersons", 1,0)
+sa_data$sl_app <- ifelse(sa_data$new_job_group_application == "First-Line Supervisors of Retail Sales Workers", 1,0)
+```
+```{r}
+#Initializing time availability binary features
+sa_data$time_slots_available <- 0
+sa_data$weekends_only <- NA
+sa_data$weekdays_only <- NA
+sa_data$both <- NA
+
+#Populating the features with values
+for (i in 1:nrow(sa_data)){
+  temp <- as.character(sa_data$times_available[i])
+  sa_data$time_slots_available[i] <- length(unlist(strsplit(temp,";")))
+  sa_data$weekends_only[i] <- ifelse(grepl("(Sat|Sun)",temp) == TRUE & grepl("(Mon|Tues|Wed|Thurs|Fri)",temp) == FALSE,1,0)
+  sa_data$weekdays_only[i] <- ifelse(grepl("(Sat|Sun)",temp) == FALSE & grepl("(Mon|Tues|Wed|Thurs|Fri)",temp) == TRUE,1,0)
+  sa_data$both[i] <- ifelse(grepl("(Sat|Sun)",temp) == TRUE & grepl("(Mon|Tues|Wed|Thurs|Fri)",temp) == TRUE,1,0)
+}
+
+#Fill in NA if no time slots selected
+sa_data$weekends_only[sa_data$time_slots_available == 0] <- NA
+sa_data$weekdays_only[sa_data$time_slots_available == 0] <- NA
+sa_data$both[sa_data$time_slots_available == 0] <- NA
+```
+
+```{r include=FALSE}
+##########################################
+#KAPLAN MEIER ESTIMATES #################
+#Build the standard survival object.
+#tenure_cont records survival time (time to event)
+#attrited indicates whether the applicant's departure was observed (status = 1) or that survival time was censored (status = 0). 
+#a "+" after the time in the print out of KM indicates censoring.
+#sa_surv <- Surv(sa_data$tenure_cont, sa_data$attrited)
+#sa_surv
+#Kaplan-Meier estimates of the rate of survival over time.
+#sa_km_fit <- survfit(sa_surv ~ 1)
+```
+
+
+# Computing Cox PH Model
+
+Round 1: Fitting the COX PH model to associate survival hazard with potential predictors
+
+```{r}
+set.seed(22)
+
+#Create the formula
+form <- formula(sa_surv ~ assess_0_30 + assess_30_70 + assess_70_100 + 
+                  weekends_only + weekdays_only + both + 
+                  sa_app + sl_app + rehire + 
+                high_school + associates + bachelor + masters_plus)
+```
+```{r}
+#Fit Cox Model
+sa_cox <- coxph(form, data = sa_data,x = TRUE)
+summary(sa_cox)
+```
+
+Plot survival estimates based on the model:
+```{r}
+sa_cox_fit <- survfit(sa_cox)
+plot(sa_km_fit$surv,
+     main = 'Sales Associate Survival Estimate', ylab = "Survival Rate", xlab = "Days",
+     xlim = c(0,365), lty = 2, pch = 20)
+points(sa_cox_fit$surv, col = "lightblue",lty = 2, pch = 20)
+legend(200, 0.99, legend = c('All Hires','Cox PH'), 
+       col = c("black","lightblue"), pch = c(20,20),
+       lwd = c(2,2))
+```
+
+Round 2: Kept only  statistically significant features at 5% significance value (dropped 'weekdays_only', 
+'both', 'assess_70_100','sl_app' and 'masters_plus')
+```{r}
+form <- formula(sa_surv ~ assess_0_30 + assess_30_70 + 
+                  weekends_only +
+                  sa_app + rehire + 
+                  high_school + associates + bachelor)
+
+#Fit Cox Model
+sa_cox <- coxph(form, data = sa_data,x = TRUE)
+summary(sa_cox)
+
+#Plot survival estimates
+sa_cox_fit <- survfit(sa_cox)
+plot(sa_km_fit$surv,
+     main = 'Sales Associate Survival Estimate', ylab = "Survival Rate", xlab = "Days",
+     xlim = c(0,365), lty = 2, pch = 20)
+points(sa_cox_fit$surv, col = "lightblue",lty = 2, pch = 20)
+legend(200, 0.99, legend = c('All Hires','Cox PH'), 
+       col = c("black","lightblue"), pch = c(20,20),
+       lwd = c(2,2))
+```
+
+
+Extracting predicted survival rates
+
+```{r}
+newdata <- subset(sa_data, select = c(applicant_id, assess_0_30,assess_30_70,assess_70_100,
+                                      weekends_only,weekdays_only,both,
+                                      sa_app,sl_app, rehire, college,
+                                    high_school, associates,bachelor, masters_plus))
+#Base hazard at time t
+bh=basehaz(sa_cox)
+
+#Example specific points in time (days) 
+times <- c(10,30,90,180,365,730)
+
+#Sample applicant IDs
+IDs<-c(14704065,14740260,15014188,15020641,15091641)
+
+#Subset data only for these IDs
+Applicants_select= subset(sa_data, sa_data$applicant_id %in% IDs)
+
+#Create empty columsn for the specified points in time
+Applicants_select$T_10<-NA
+Applicants_select$T_30<-NA
+Applicants_select$T_90<-NA
+Applicants_select$T_180<-NA
+Applicants_select$T_365<-NA
+Applicants_select$T_730<-NA
+
+
+#Formula to calculate Survival at a given point in time for a given person p:
+#exp(-bh$hazard[times])^(exp(sum(sa_cox$coefficients*newdata[person,], na.rm = TRUE)))
+for (i in 1: length(IDs)){
+  
+    Applicants_select$T_10[i]=exp(-bh$hazard[10])^(exp(sum(sa_cox$coefficients*newdata[newdata$applicant_id==IDs[i],][, -(which(names(newdata) %in% "applicant_id"))], na.rm = TRUE)))
+    
+    Applicants_select$T_30[i]=exp(-bh$hazard[30])^(exp(sum(sa_cox$coefficients*newdata[newdata$applicant_id==IDs[i],][, -(which(names(newdata) %in% "applicant_id"))], na.rm = TRUE)))
+    
+    Applicants_select$T_90[i]=exp(-bh$hazard[90])^(exp(sum(sa_cox$coefficients*newdata[newdata$applicant_id==IDs[i],][, -(which(names(newdata) %in% "applicant_id"))], na.rm = TRUE)))
+    
+    Applicants_select$T_180[i]=exp(-bh$hazard[180])^(exp(sum(sa_cox$coefficients*newdata[newdata$applicant_id==IDs[i],][, -(which(names(newdata) %in% "applicant_id"))], na.rm = TRUE)))
+    
+    Applicants_select$T_365[i]=exp(-bh$hazard[365])^(exp(sum(sa_cox$coefficients*newdata[newdata$applicant_id==IDs[i],][, -(which(names(newdata) %in% "applicant_id"))], na.rm = TRUE)))
+    
+    Applicants_select$T_730[i]=exp(-bh$hazard[730])^(exp(sum(sa_cox$coefficients*newdata[newdata$applicant_id==IDs[i],][, -(which(names(newdata) %in% "applicant_id"))], na.rm = TRUE)))
+  
+}
+
+#Saving survival rates at the specified points in time for the randomly selected applicants
+#Applicants_select=subset(Applicants_select,select = c("T_10","T_30","T_90","T_180","T_365","T_730"))
+#write.csv(Applicants_select, file = "Applicants_select.csv")
+```
+
+
+# Model Diagnostics
+
+```{r}
+#Testing  for the proportional-hazards (PH) assumption
+#A p-value less than 0.05 indicates a violation of the proportionality assumption.
+test.ph <- cox.zph(sa_cox)
+test.ph
+
+
+#Identfying outliers
+dresids <- residuals( sa_cox, type="deviance" )
+lp <- predict(sa_cox, type="lp" )
+plot(lp, dresids, xlab="Linear Predictor", ylab="Deviance Residual")
+########################
+
+#Testing for influential observations
+#ggcoxdiagnostics(sa_cox, type = , linear.predictions = TRUE)
+#dfbetas <- residuals(sa_cox, type="dfbetas")
